@@ -1,0 +1,1791 @@
+ import os
+print(os.listdir())
+# ============================================================
+# COMPLETE MULTI-SENSOR PREDICTIVE MAINTENANCE SYSTEM
+# UPGRADED INDUSTRIAL VERSION
+# CWRU + ACOUSTIC + SENSOR FUSION
+# RANDOM FOREST + CNN-BiLSTM + HYBRID ENSEMBLE
+# ============================================================
+
+# ============================================================
+# INSTALL LIBRARIES
+# ============================================================
+
+!pip install librosa soundfile -q
+
+# ============================================================
+# IMPORT LIBRARIES
+# ============================================================
+
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import librosa
+
+warnings.filterwarnings("ignore")
+
+from scipy.io import loadmat
+from scipy.signal import butter, filtfilt
+from scipy.stats import kurtosis, skew
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix
+)
+
+from sklearn.utils.class_weight import compute_class_weight
+
+import tensorflow as tf
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input,
+    Conv1D,
+    MaxPooling1D,
+    Bidirectional,
+    LSTM,
+    Dense,
+    Dropout,
+    BatchNormalization,
+    Layer
+)
+
+from tensorflow.keras.callbacks import (
+    EarlyStopping,
+    ReduceLROnPlateau
+)
+
+from tensorflow.keras.utils import to_categorical
+
+# ============================================================
+# SHOW FILES
+# ============================================================
+
+print("======================================")
+print("UPLOADED FILES")
+print("======================================")
+
+print(os.listdir())
+
+# ============================================================
+# MAT FILE LABELS
+# ============================================================
+
+mat_files = {
+
+    "109.mat": "Normal",
+    "110.mat": "Normal",
+    "111.mat": "Normal",
+    "112.mat": "Normal",
+
+    "122.mat": "Ball_007",
+    "123.mat": "Ball_014",
+    "124.mat": "Ball_021",
+    "125.mat": "Ball_021",
+
+    "174.mat": "IR_007",
+    "189.mat": "IR_014",
+    "190.mat": "IR_014",
+    "203.mat": "IR_021",
+
+    "226.mat": "OR_007",
+    "229.mat": "OR_014",
+    "192.mat": "OR_014",
+    "136.mat": "OR_021",
+    "241-2.mat": "OR_021"
+}
+
+# ============================================================
+# LOAD MAT FILE
+# ============================================================
+
+def safe_loadmat(file_name):
+
+    try:
+        return loadmat(file_name)
+
+    except Exception as e:
+        print("Error loading:", file_name, e)
+        return None
+
+# ============================================================
+# EXTRACT SIGNAL
+# ============================================================
+
+def extract_signal(file_name):
+
+    mat = safe_loadmat(file_name)
+
+    if mat is None:
+        return None
+
+    for key in mat.keys():
+
+        if "DE_time" in key:
+            return mat[key].flatten()
+
+    for key in mat.keys():
+
+        if not key.startswith("__"):
+
+            if isinstance(mat[key], np.ndarray):
+
+                arr = mat[key].flatten()
+
+                if len(arr) > 1000:
+                    return arr
+
+    return None
+
+# ============================================================
+# BANDPASS FILTER
+# ============================================================
+
+def bandpass_filter(signal,
+                    lowcut=500,
+                    highcut=5000,
+                    fs=12000,
+                    order=4):
+
+    nyquist = 0.5 * fs
+
+    low = lowcut / nyquist
+    high = highcut / nyquist
+
+    b, a = butter(order, [low, high], btype="band")
+
+    return filtfilt(b, a, signal)
+
+# ============================================================
+# VIBRATION FEATURES
+# ============================================================
+
+def vibration_features(segment):
+
+    fft_vals = np.abs(np.fft.rfft(segment))
+
+    return [
+
+        np.mean(segment),
+        np.std(segment),
+        np.max(segment),
+        np.min(segment),
+
+        np.ptp(segment),
+
+        np.sqrt(np.mean(segment ** 2)),
+
+        kurtosis(segment),
+
+        skew(segment),
+
+        np.mean(fft_vals),
+        np.std(fft_vals),
+        np.max(fft_vals),
+
+        np.argmax(fft_vals)
+    ]
+
+vibration_feature_names = [
+
+    "Vib Mean",
+    "Vib Std",
+    "Vib Max",
+    "Vib Min",
+    "PeakPeak",
+    "RMS",
+    "Kurtosis",
+    "Skewness",
+    "FFT Mean",
+    "FFT Std",
+    "FFT Max",
+    "Dominant Frequency"
+]
+
+# ============================================================
+# LOAD VIBRATION DATA
+# ============================================================
+
+X_raw = []
+X_vib = []
+y = []
+
+segment_size = 1024
+
+used_mat = []
+skipped_mat = []
+
+for file_name, label in mat_files.items():
+
+    if not os.path.exists(file_name):
+
+        skipped_mat.append(file_name)
+        continue
+
+    signal = extract_signal(file_name)
+
+    if signal is None:
+
+        skipped_mat.append(file_name)
+        continue
+
+    signal = bandpass_filter(signal)
+
+    signal = (
+        signal - np.mean(signal)
+    ) / np.std(signal)
+
+    num_segments = len(signal) // segment_size
+
+    for i in range(num_segments):
+
+        segment = signal[
+            i * segment_size:
+            (i + 1) * segment_size
+        ]
+
+        X_raw.append(
+            segment.reshape(segment_size, 1)
+        )
+
+        X_vib.append(
+            vibration_features(segment)
+        )
+
+        y.append(label)
+
+    used_mat.append(file_name)
+
+X_raw = np.array(X_raw)
+X_vib = np.array(X_vib)
+y = np.array(y)
+
+print("\n======================================")
+print("VIBRATION DATA")
+print("======================================")
+
+print("Used MAT:", used_mat)
+print("Skipped MAT:", skipped_mat)
+
+print("Raw shape:", X_raw.shape)
+print("Feature shape:", X_vib.shape)
+
+print("Classes:", np.unique(y))
+
+# ============================================================
+# FIX CSV PARSER ERROR
+# ============================================================
+
+# REPLACE YOUR OLD load_csv FUNCTION WITH THIS
+
+def load_csv(file_name):
+
+    try:
+
+        if os.path.exists(file_name):
+
+            df = pd.read_csv(
+
+                file_name,
+
+                engine="python",
+
+                on_bad_lines="skip"
+            )
+
+            df.columns = df.columns.str.strip()
+
+            df = df.select_dtypes(include=[np.number])
+
+            print(file_name, "LOADED SUCCESSFULLY")
+
+            return df
+
+        else:
+
+            print(file_name, "NOT FOUND")
+
+            return pd.DataFrame()
+
+    except Exception as e:
+
+        print("ERROR LOADING:", file_name)
+
+        print(e)
+
+        return pd.DataFrame()
+
+# ============================================================
+# LOAD CSV FILES AGAIN
+# ============================================================
+
+first_df = load_csv("First_Part_Small.csv")
+
+second_df = load_csv("Second_Part.csv")
+
+third_df = load_csv("Third_Part.csv")
+
+# ============================================================
+# SHOW SHAPES
+# ============================================================
+
+print("\n======================================")
+print("CSV DATA")
+print("======================================")
+
+print("First CSV Shape :", first_df.shape)
+
+print("Second CSV Shape:", second_df.shape)
+
+print("Third CSV Shape :", third_df.shape)
+
+# ============================================================
+# CSV FEATURES
+# ============================================================
+
+def csv_features(df, prefix):
+
+    feats = []
+    names = []
+
+    if df.empty:
+        return feats, names
+
+    for col in df.columns:
+
+        values = df[col].dropna().values
+
+        if len(values) == 0:
+            continue
+
+        feats.extend([
+
+            np.mean(values),
+            np.std(values),
+            np.max(values),
+            np.min(values),
+
+            np.sqrt(np.mean(values ** 2))
+        ])
+
+        names.extend([
+
+            f"{prefix}_{col}_mean",
+            f"{prefix}_{col}_std",
+            f"{prefix}_{col}_max",
+            f"{prefix}_{col}_min",
+            f"{prefix}_{col}_rms"
+        ])
+
+    return feats, names
+
+first_feats, first_names = csv_features(
+    first_df,
+    "electrical"
+)
+
+second_feats, second_names = csv_features(
+    second_df,
+    "thermal"
+)
+
+third_feats, third_names = csv_features(
+    third_df,
+    "power"
+)
+
+csv_global = (
+    first_feats +
+    second_feats +
+    third_feats
+)
+
+csv_feature_names = (
+    first_names +
+    second_names +
+    third_names
+)
+
+if len(csv_global) == 0:
+
+    csv_global = [0]
+    csv_feature_names = ["No_CSV"]
+
+csv_repeated = np.tile(
+    csv_global,
+    (len(X_vib), 1)
+)
+
+X_fused = np.hstack([
+    X_vib,
+    csv_repeated
+])
+
+all_feature_names = (
+    vibration_feature_names +
+    csv_feature_names
+)
+
+print("\nFinal fused shape:", X_fused.shape)
+
+# ============================================================
+# ACOUSTIC FEATURES
+# ============================================================
+
+audio_features = []
+audio_labels = []
+
+wav_files = [
+    f for f in os.listdir()
+    if f.endswith(".wav")
+]
+
+print("\n======================================")
+print("ACOUSTIC DATA")
+print("======================================")
+
+print("Total WAV files:", len(wav_files))
+
+for wav_file in wav_files:
+
+    try:
+
+        signal, sr = librosa.load(
+            wav_file,
+            sr=16000
+        )
+
+        noise = np.random.randn(len(signal))
+        signal = signal + 0.003 * noise
+
+        mfcc = librosa.feature.mfcc(
+            y=signal,
+            sr=sr,
+            n_mfcc=13
+        )
+
+        zcr = librosa.feature.zero_crossing_rate(signal)
+
+        centroid = librosa.feature.spectral_centroid(
+            y=signal,
+            sr=sr
+        )
+
+        rms = librosa.feature.rms(y=signal)
+
+        rolloff = librosa.feature.spectral_rolloff(
+            y=signal,
+            sr=sr
+        )
+
+        bandwidth = librosa.feature.spectral_bandwidth(
+            y=signal,
+            sr=sr
+        )
+
+        features = []
+
+        features.extend(np.mean(mfcc, axis=1))
+        features.extend(np.std(mfcc, axis=1))
+
+        features.extend([
+
+            np.mean(zcr),
+
+            np.mean(centroid),
+
+            np.mean(rms),
+
+            np.mean(rolloff),
+
+            np.mean(bandwidth)
+        ])
+
+        audio_features.append(features)
+
+        lower_name = wav_file.lower()
+
+        if "ball_007" in lower_name:
+            audio_labels.append("Ball_007")
+
+        elif "ball_014" in lower_name:
+            audio_labels.append("Ball_014")
+
+        elif "ball_021" in lower_name:
+            audio_labels.append("Ball_021")
+
+        elif "ir_007" in lower_name:
+            audio_labels.append("IR_007")
+
+        elif "ir_014" in lower_name:
+            audio_labels.append("IR_014")
+
+        elif "ir_021" in lower_name:
+            audio_labels.append("IR_021")
+
+        elif "or_007" in lower_name:
+            audio_labels.append("OR_007")
+
+        elif "or_014" in lower_name:
+            audio_labels.append("OR_014")
+
+        elif "or_021" in lower_name:
+            audio_labels.append("OR_021")
+
+        elif "normal" in lower_name:
+            audio_labels.append("Normal")
+
+    except Exception as e:
+
+        print("Skipping:", wav_file, e)
+
+X_audio = np.array(audio_features)
+y_audio = np.array(audio_labels)
+
+print("Audio feature shape:", X_audio.shape)
+print("Audio classes:", np.unique(y_audio))
+
+# ============================================================
+# AUDIO RANDOM FOREST
+# ============================================================
+
+audio_accuracy = 0
+audio_status = "Unavailable"
+audio_confidence = 0
+
+if len(X_audio) > 10:
+
+    audio_encoder = LabelEncoder()
+
+    y_audio_encoded = audio_encoder.fit_transform(
+        y_audio
+    )
+
+    X_audio_train, X_audio_test, y_audio_train, y_audio_test = train_test_split(
+
+        X_audio,
+        y_audio_encoded,
+
+        test_size=0.2,
+        random_state=42,
+        stratify=y_audio_encoded
+    )
+
+    audio_scaler = StandardScaler()
+
+    X_audio_train = audio_scaler.fit_transform(
+        X_audio_train
+    )
+
+    X_audio_test = audio_scaler.transform(
+        X_audio_test
+    )
+
+    audio_model = RandomForestClassifier(
+
+        n_estimators=300,
+        random_state=42
+    )
+
+    audio_model.fit(
+        X_audio_train,
+        y_audio_train
+    )
+
+    audio_pred = audio_model.predict(
+        X_audio_test
+    )
+
+    audio_prob = audio_model.predict_proba(
+        X_audio_test
+    )
+
+    audio_accuracy = accuracy_score(
+        y_audio_test,
+        audio_pred
+    )
+
+    sample_audio_pred = audio_pred[0]
+
+    audio_status = audio_encoder.inverse_transform(
+        [sample_audio_pred]
+    )[0]
+
+    audio_confidence = np.max(audio_prob[0])
+
+    print("\nAudio Accuracy:", audio_accuracy)
+
+# ============================================================
+# LABEL ENCODING
+# ============================================================
+
+encoder = LabelEncoder()
+
+y_encoded = encoder.fit_transform(y)
+
+y_cat = to_categorical(y_encoded)
+
+# ============================================================
+# TRAIN TEST SPLIT
+# ============================================================
+
+(
+    X_raw_train,
+    X_raw_test,
+
+    X_fused_train,
+    X_fused_test,
+
+    y_train,
+    y_test,
+
+    y_cat_train,
+    y_cat_test
+
+) = train_test_split(
+
+    X_raw,
+    X_fused,
+    y_encoded,
+    y_cat,
+
+    test_size=0.2,
+    random_state=42,
+    stratify=y_encoded
+)
+
+# ============================================================
+# RANDOM FOREST
+# ============================================================
+
+scaler = StandardScaler()
+
+X_fused_train_scaled = scaler.fit_transform(
+    X_fused_train
+)
+
+X_fused_test_scaled = scaler.transform(
+    X_fused_test
+)
+
+rf_model = RandomForestClassifier(
+
+    n_estimators=500,
+
+    random_state=42,
+
+    class_weight="balanced",
+
+    n_jobs=-1
+)
+
+rf_model.fit(
+    X_fused_train_scaled,
+    y_train
+)
+
+rf_pred = rf_model.predict(
+    X_fused_test_scaled
+)
+
+rf_prob = rf_model.predict_proba(
+    X_fused_test_scaled
+)
+
+rf_accuracy = accuracy_score(
+    y_test,
+    rf_pred
+)
+
+print("\n======================================")
+print("RANDOM FOREST")
+print("======================================")
+
+print("Accuracy:", rf_accuracy)
+
+# ============================================================
+# ATTENTION LAYER
+# ============================================================
+
+class AttentionLayer(Layer):
+
+    def __init__(self):
+        super(AttentionLayer, self).__init__()
+
+    def build(self, input_shape):
+
+        self.W = self.add_weight(
+
+            shape=(input_shape[-1], 1),
+
+            initializer="random_normal",
+
+            trainable=True
+        )
+
+        self.b = self.add_weight(
+
+            shape=(input_shape[1], 1),
+
+            initializer="zeros",
+
+            trainable=True
+        )
+
+    def call(self, inputs):
+
+        score = tf.keras.backend.tanh(
+            tf.keras.backend.dot(inputs, self.W) + self.b
+        )
+
+        weights = tf.keras.backend.softmax(
+            score,
+            axis=1
+        )
+
+        context = inputs * weights
+
+        context = tf.keras.backend.sum(
+            context,
+            axis=1
+        )
+
+        return context
+
+# ============================================================
+# CLASS WEIGHTS
+# ============================================================
+
+class_weights = compute_class_weight(
+
+    class_weight="balanced",
+
+    classes=np.unique(y_train),
+
+    y=y_train
+)
+
+class_weights = dict(
+    enumerate(class_weights)
+)
+
+# ============================================================
+# CNN BiLSTM MODEL
+# ============================================================
+
+input_layer = Input(shape=(1024, 1))
+
+x = Conv1D(
+    64,
+    5,
+    activation="relu"
+)(input_layer)
+
+x = BatchNormalization()(x)
+
+x = MaxPooling1D(2)(x)
+
+x = Conv1D(
+    128,
+    5,
+    activation="relu"
+)(x)
+
+x = BatchNormalization()(x)
+
+x = MaxPooling1D(2)(x)
+
+x = Bidirectional(
+    LSTM(
+        64,
+        return_sequences=True
+    )
+)(x)
+
+x = AttentionLayer()(x)
+
+x = Dense(
+    128,
+    activation="relu"
+)(x)
+
+x = Dropout(0.3)(x)
+
+output_layer = Dense(
+
+    len(encoder.classes_),
+
+    activation="softmax"
+)(x)
+
+dl_model = Model(
+    inputs=input_layer,
+    outputs=output_layer
+)
+
+dl_model.compile(
+
+    optimizer="adam",
+
+    loss="categorical_crossentropy",
+
+    metrics=["accuracy"]
+)
+
+early_stop = EarlyStopping(
+
+    monitor="val_loss",
+
+    patience=5,
+
+    restore_best_weights=True
+)
+
+reduce_lr = ReduceLROnPlateau(
+
+    monitor="val_loss",
+
+    factor=0.5,
+
+    patience=3
+)
+
+print("\n======================================")
+print("TRAINING CNN BiLSTM")
+print("======================================")
+
+history = dl_model.fit(
+
+    X_raw_train,
+    y_cat_train,
+
+    epochs=20,
+
+    batch_size=32,
+
+    validation_split=0.2,
+
+    callbacks=[
+        early_stop,
+        reduce_lr
+    ],
+
+    class_weight=class_weights,
+
+    verbose=1
+)
+
+dl_prob = dl_model.predict(
+    X_raw_test
+)
+
+dl_pred = np.argmax(
+    dl_prob,
+    axis=1
+)
+
+dl_accuracy = accuracy_score(
+    y_test,
+    dl_pred
+)
+
+print("\n======================================")
+print("CNN BiLSTM RESULT")
+print("======================================")
+
+print("Accuracy:", dl_accuracy)
+
+# ============================================================
+# HYBRID ENSEMBLE
+# ============================================================
+
+rf_weight = rf_accuracy / (
+    rf_accuracy + dl_accuracy
+)
+
+dl_weight = dl_accuracy / (
+    rf_accuracy + dl_accuracy
+)
+
+ensemble_prob = (
+
+    rf_prob * rf_weight
+
+) + (
+
+    dl_prob * dl_weight
+)
+
+ensemble_pred = np.argmax(
+    ensemble_prob,
+    axis=1
+)
+
+ensemble_accuracy = accuracy_score(
+    y_test,
+    ensemble_pred
+)
+
+print("\n======================================")
+print("HYBRID ENSEMBLE")
+print("======================================")
+
+print("Accuracy:", ensemble_accuracy)
+
+# ============================================================
+# BEST MODEL
+# ============================================================
+
+accuracies = {
+
+    "Random Forest": rf_accuracy,
+
+    "CNN-BiLSTM": dl_accuracy,
+
+    "Hybrid Ensemble": ensemble_accuracy
+}
+
+best_model = max(
+    accuracies,
+    key=accuracies.get
+)
+
+print("\nBest Model:", best_model)
+
+# ============================================================
+# FINAL PREDICTION
+# ============================================================
+
+if best_model == "Random Forest":
+
+    final_pred = rf_pred
+    final_prob = rf_prob
+
+elif best_model == "CNN-BiLSTM":
+
+    final_pred = dl_pred
+    final_prob = dl_prob
+
+else:
+
+    final_pred = ensemble_pred
+    final_prob = ensemble_prob
+
+# ============================================================
+# FAULT DETAILS
+# ============================================================
+
+def fault_details(predicted_class):
+
+    if predicted_class == "Normal":
+
+        return (
+            "Healthy Motor",
+            "Healthy",
+            5,
+            100
+        )
+
+    if "Ball" in predicted_class:
+        fault_type = "Ball Bearing Fault"
+
+    elif "IR" in predicted_class:
+        fault_type = "Inner Race Fault"
+
+    else:
+        fault_type = "Outer Race Fault"
+
+    if "007" in predicted_class:
+
+        severity = "Early"
+        risk = 35
+        rul = 70
+
+    elif "014" in predicted_class:
+
+        severity = "Medium"
+        risk = 65
+        rul = 40
+
+    else:
+
+        severity = "Severe"
+        risk = 90
+        rul = 15
+
+    return (
+        fault_type,
+        severity,
+        risk,
+        rul
+    )
+
+sample_index = 0
+
+actual_class = encoder.classes_[y_test[sample_index]]
+
+predicted_class = encoder.classes_[
+    final_pred[sample_index]
+]
+
+confidence = np.max(
+    final_prob[sample_index]
+)
+
+fault_type, severity, risk, rul = fault_details(
+    predicted_class
+)
+
+risk_score = round(
+    risk * confidence,
+    2
+)
+
+machine_health = round(
+    100 - risk_score,
+    2
+)
+
+estimated_rul = round(
+    rul * (machine_health / 100),
+    2
+)
+
+# ============================================================
+# SENSOR STATS
+# ============================================================
+
+def get_sensor_stats(df):
+
+    if df.empty:
+        return "NA", "NA"
+
+    vals = df.values.flatten()
+
+    vals = vals[~np.isnan(vals)]
+
+    vals = vals / 100
+
+    return (
+
+        round(np.mean(vals), 2),
+
+        round(np.max(vals), 2)
+    )
+
+temp_mean, temp_max = get_sensor_stats(
+    second_df
+)
+
+current_mean, current_max = get_sensor_stats(
+    first_df
+)
+
+power_mean, power_max = get_sensor_stats(
+    third_df
+)
+
+# ============================================================
+# MAINTENANCE DECISION
+# ============================================================
+
+def maintenance_decision(
+
+    machine_health,
+    risk_score,
+
+    temp_mean,
+    temp_max,
+
+    current_mean,
+    power_mean,
+
+    severity
+):
+
+    alerts = []
+
+    if isinstance(temp_mean, (int, float)):
+
+        if temp_mean > 80:
+            alerts.append("High Temperature")
+
+        if temp_max > 120:
+            alerts.append("Extreme Temperature Spike")
+
+    if isinstance(current_mean, (int, float)):
+
+        if current_mean > 100:
+            alerts.append("High Current Consumption")
+
+    if isinstance(power_mean, (int, float)):
+
+        if power_mean > 100:
+            alerts.append("High Power Consumption")
+
+    if machine_health < 20:
+        alerts.append("Critical Machine Health")
+
+    elif machine_health < 50:
+        alerts.append("Poor Machine Health")
+
+    if severity == "Severe":
+
+        decision = "IMMEDIATE MAINTENANCE REQUIRED"
+
+        recommendation = (
+            "Stop motor immediately and inspect bearings."
+        )
+
+    elif risk_score > 70:
+
+        decision = "URGENT MAINTENANCE REQUIRED"
+
+        recommendation = (
+            "Maintenance needed within 24 hours."
+        )
+
+    elif risk_score > 40:
+
+        decision = "MAINTENANCE RECOMMENDED"
+
+        recommendation = (
+            "Monitor motor continuously."
+        )
+
+    else:
+
+        decision = "NO MAINTENANCE REQUIRED"
+
+        recommendation = (
+            "Motor operating normally."
+        )
+
+    return decision, recommendation, alerts
+
+maintenance_status, maintenance_recommendation, alerts = maintenance_decision(
+
+    machine_health,
+    risk_score,
+
+    temp_mean,
+    temp_max,
+
+    current_mean,
+    power_mean,
+
+    severity
+)
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+dashboard = pd.DataFrame({
+
+    "Prediction Area": [
+
+        "Motor Type",
+
+        "Best AI Model",
+
+        "Random Forest Accuracy",
+
+        "CNN BiLSTM Accuracy",
+
+        "Hybrid Accuracy",
+
+        "Actual Condition",
+
+        "Predicted Condition",
+
+        "Fault Type",
+
+        "Severity",
+
+        "Confidence",
+
+        "Machine Health",
+
+        "Risk Score",
+
+        "Estimated RUL",
+
+        "Temperature Mean",
+
+        "Temperature Max",
+
+        "Current Mean",
+
+        "Current Max",
+
+        "Power Mean",
+
+        "Power Max",
+
+        "Acoustic Prediction",
+
+        "Acoustic Accuracy",
+
+        "Acoustic Confidence",
+
+        "Maintenance Status",
+
+        "Recommendation",
+
+        "Alerts"
+    ],
+
+    "Output": [
+
+        "3-Phase Induction Motor",
+
+        best_model,
+
+        str(round(rf_accuracy * 100, 2)) + "%",
+
+        str(round(dl_accuracy * 100, 2)) + "%",
+
+        str(round(ensemble_accuracy * 100, 2)) + "%",
+
+        actual_class,
+
+        predicted_class,
+
+        fault_type,
+
+        severity,
+
+        str(round(confidence * 100, 2)) + "%",
+
+        str(machine_health) + "%",
+
+        str(risk_score) + "%",
+
+        estimated_rul,
+
+        temp_mean,
+
+        temp_max,
+
+        current_mean,
+
+        current_max,
+
+        power_mean,
+
+        power_max,
+
+        audio_status,
+
+        str(round(audio_accuracy * 100, 2)) + "%",
+
+        str(round(audio_confidence * 100, 2)) + "%",
+
+        maintenance_status,
+
+        maintenance_recommendation,
+
+        ", ".join(alerts)
+    ]
+})
+
+print("\n======================================")
+print("FINAL DASHBOARD")
+print("======================================")
+
+display(dashboard)
+
+# ============================================================
+# SAVE MODELS
+# ============================================================
+
+dl_model.save("cnn_bilstm_model.h5")
+
+import joblib
+
+joblib.dump(
+    rf_model,
+    "rf_model.pkl"
+)
+
+# ============================================================
+# CONFUSION MATRIX
+# ============================================================
+
+cm = confusion_matrix(
+    y_test,
+    final_pred
+)
+
+plt.figure(figsize=(10, 8))
+
+plt.imshow(cm)
+
+plt.title("Confusion Matrix")
+
+plt.colorbar()
+
+plt.xticks(
+    range(len(encoder.classes_)),
+    encoder.classes_,
+    rotation=45
+)
+
+plt.yticks(
+    range(len(encoder.classes_)),
+    encoder.classes_
+)
+
+plt.xlabel("Predicted")
+plt.ylabel("True")
+
+plt.show()
+
+# ============================================================
+# ACCURACY GRAPH
+# ============================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.bar(
+
+    [
+        "RF",
+        "CNN-BiLSTM",
+        "Hybrid"
+    ],
+
+    [
+        rf_accuracy * 100,
+        dl_accuracy * 100,
+        ensemble_accuracy * 100
+    ]
+)
+
+plt.ylabel("Accuracy %")
+
+plt.title("Model Accuracy Comparison")
+
+plt.ylim(0, 100)
+
+plt.show()
+
+# ============================================================
+# TRAINING GRAPH
+# ============================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    history.history["accuracy"],
+    label="Train"
+)
+
+plt.plot(
+    history.history["val_accuracy"],
+    label="Validation"
+)
+
+plt.legend()
+
+plt.xlabel("Epoch")
+
+plt.ylabel("Accuracy")
+
+plt.title("CNN-BiLSTM Training")
+
+plt.show()
+
+# ============================================================
+# FEATURE IMPORTANCE
+# ============================================================
+
+importances = rf_model.feature_importances_
+
+indices = np.argsort(importances)[::-1][:15]
+
+plt.figure(figsize=(10, 6))
+
+plt.barh(
+
+    [all_feature_names[i] for i in indices],
+
+    importances[indices]
+)
+
+plt.gca().invert_yaxis()
+
+plt.title("Top Important Features")
+
+plt.xlabel("Importance")
+
+plt.show()
+
+# ============================================================
+# HEALTH GRAPH
+# ============================================================
+
+plt.figure(figsize=(7, 5))
+
+plt.bar(
+
+    [
+        "Health",
+        "Risk",
+        "RUL"
+    ],
+
+    [
+        machine_health,
+        risk_score,
+        estimated_rul
+    ]
+)
+
+plt.ylim(0, 100)
+
+plt.title("Motor Health Dashboard")
+
+plt.ylabel("Percentage")
+
+plt.show()
+
+print("\n======================================")
+print("SYSTEM COMPLETED SUCCESSFULLY")
+print("======================================")
+# ============================================================
+# IMPORTANT
+# ============================================================
+# Your training code was NOT executed fully.
+# So these variables were never created:
+#
+# y_test
+# final_pred
+# final_prob
+#
+# You MUST RUN the FULL MODEL TRAINING CODE FIRST.
+#
+# Especially these sections:
+#
+# 1. Train Test Split
+# 2. Random Forest
+# 3. CNN-BiLSTM
+# 4. Hybrid Ensemble
+# 5. Final Prediction
+#
+# AFTER THAT only run metrics code.
+# ============================================================
+
+
+# ============================================================
+# CHECK IF VARIABLES EXIST
+# ============================================================
+
+required_vars = [
+
+    "y_test",
+    "final_pred",
+    "final_prob",
+    "y_cat_test",
+    "encoder",
+    "rf_accuracy",
+    "dl_accuracy",
+    "audio_accuracy"
+]
+
+missing = []
+
+for var in required_vars:
+
+    if var not in globals():
+
+        missing.append(var)
+
+# ============================================================
+# SHOW MISSING VARIABLES
+# ============================================================
+
+if len(missing) > 0:
+
+    print("\n======================================")
+    print("MISSING VARIABLES")
+    print("======================================")
+
+    for m in missing:
+
+        print("Missing ->", m)
+
+    print("\nRUN THE FULL TRAINING CODE FIRST")
+    print("THEN RUN THE METRICS CODE")
+
+else:
+
+    print("\n======================================")
+    print("ALL VARIABLES AVAILABLE")
+    print("YOU CAN RUN METRICS NOW")
+    print("======================================")
+# ============================================================
+# COMPLETE PARAMETER VALUES PRINTING CODE
+# ============================================================
+
+from sklearn.metrics import (
+
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    matthews_corrcoef,
+    cohen_kappa_score,
+    roc_auc_score,
+    log_loss,
+    confusion_matrix,
+    classification_report
+)
+
+import numpy as np
+import pandas as pd
+
+# ============================================================
+# CALCULATE METRICS
+# ============================================================
+
+accuracy = accuracy_score(
+    y_test,
+    final_pred
+)
+
+precision = precision_score(
+
+    y_test,
+    final_pred,
+
+    average="weighted"
+)
+
+recall = recall_score(
+
+    y_test,
+    final_pred,
+
+    average="weighted"
+)
+
+f1 = f1_score(
+
+    y_test,
+    final_pred,
+
+    average="weighted"
+)
+
+balanced_acc = balanced_accuracy_score(
+    y_test,
+    final_pred
+)
+
+mcc = matthews_corrcoef(
+    y_test,
+    final_pred
+)
+
+kappa = cohen_kappa_score(
+    y_test,
+    final_pred
+)
+
+# ============================================================
+# ROC AUC
+# ============================================================
+
+try:
+
+    roc_auc = roc_auc_score(
+
+        y_cat_test,
+        final_prob,
+
+        multi_class="ovr"
+    )
+
+except:
+
+    roc_auc = 0
+
+# ============================================================
+# LOG LOSS
+# ============================================================
+
+try:
+
+    loss_value = log_loss(
+        y_test,
+        final_prob
+    )
+
+except:
+
+    loss_value = 0
+
+# ============================================================
+# SENSOR FUSION SCORE
+# ============================================================
+
+fusion_score = (
+
+    rf_accuracy +
+    dl_accuracy +
+    audio_accuracy
+
+) / 3
+
+# ============================================================
+# PREDICTIVE MAINTENANCE INDEX
+# ============================================================
+
+predictive_index = (
+
+    accuracy * 0.4 +
+
+    f1 * 0.3 +
+
+    roc_auc * 0.2 +
+
+    balanced_acc * 0.1
+)
+
+# ============================================================
+# PRINT ALL PARAMETER VALUES
+# ============================================================
+
+print("\n======================================")
+print("ADVANCED PERFORMANCE PARAMETERS")
+print("======================================")
+
+print(f"Accuracy                  : {accuracy:.4f}")
+
+print(f"Precision                 : {precision:.4f}")
+
+print(f"Recall                    : {recall:.4f}")
+
+print(f"F1 Score                  : {f1:.4f}")
+
+print(f"Balanced Accuracy         : {balanced_acc:.4f}")
+
+print(f"Matthews Corrcoef (MCC)   : {mcc:.4f}")
+
+print(f"Cohen Kappa Score         : {kappa:.4f}")
+
+print(f"ROC AUC Score             : {roc_auc:.4f}")
+
+print(f"Log Loss                  : {loss_value:.4f}")
+
+print(f"Sensor Fusion Score       : {fusion_score:.4f}")
+
+print(f"Predictive Maintenance IDX: {predictive_index:.4f}")
+
+print(f"Random Forest Accuracy    : {rf_accuracy:.4f}")
+
+print(f"CNN-BiLSTM Accuracy       : {dl_accuracy:.4f}")
+
+print(f"Hybrid Ensemble Accuracy  : {ensemble_accuracy:.4f}")
+
+print(f"Acoustic Accuracy         : {audio_accuracy:.4f}")
+
+# ============================================================
+# CONFUSION MATRIX
+# ============================================================
+
+cm = confusion_matrix(
+    y_test,
+    final_pred
+)
+
+print("\n======================================")
+print("CONFUSION MATRIX")
+print("======================================")
+
+print(cm)
+
+# ============================================================
+# CLASSIFICATION REPORT
+# ============================================================
+
+print("\n======================================")
+print("CLASSIFICATION REPORT")
+print("======================================")
+
+print(
+
+    classification_report(
+
+        y_test,
+        final_pred,
+
+        target_names=encoder.classes_
+    )
+)
+
+# ============================================================
+# CREATE FINAL TABLE
+# ============================================================
+
+metrics_df = pd.DataFrame({
+
+    "Parameter": [
+
+        "Accuracy",
+        "Precision",
+        "Recall",
+        "F1 Score",
+        "Balanced Accuracy",
+        "MCC",
+        "Cohen Kappa",
+        "ROC AUC",
+        "Log Loss",
+        "Fusion Score",
+        "Predictive Maintenance Index",
+        "RF Accuracy",
+        "CNN-BiLSTM Accuracy",
+        "Hybrid Accuracy",
+        "Acoustic Accuracy"
+    ],
+
+    "Value": [
+
+        accuracy,
+        precision,
+        recall,
+        f1,
+        balanced_acc,
+        mcc,
+        kappa,
+        roc_auc,
+        loss_value,
+        fusion_score,
+        predictive_index,
+        rf_accuracy,
+        dl_accuracy,
+        ensemble_accuracy,
+        audio_accuracy
+    ]
+})
+
+print("\n======================================")
+print("FINAL PARAMETERS TABLE")
+print("======================================")
+
+display(metrics_df)
+
+print("\n======================================")
+print("ALL PARAMETERS GENERATED SUCCESSFULLY")
+print("======================================")
+
+
